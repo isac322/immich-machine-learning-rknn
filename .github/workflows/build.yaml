@@ -130,8 +130,10 @@ jobs:
         with:
           context: ./immich/machine-learning
           file: ./immich/machine-learning/Dockerfile
-          target: prod-rknn
+          target: prod
           platforms: linux/arm64
+          build-args: |
+            DEVICE=rknn
           push: true
           provenance: false
           tags: ${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.tag }}
