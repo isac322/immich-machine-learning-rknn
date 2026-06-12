@@ -1,0 +1,150 @@
+name: build-rknn-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      immich_version:
+        description: Immich tag to build (e.g. v2.7.5). Empty = latest release.
+        required: false
+        type: string
+      force_rebuild:
+        description: Rebuild even if our package already has the matching tag.
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 4 * * *'   # daily UTC 04:00, poll immich-app/immich latest release
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build.yaml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PATCH_FILE: patches/pr-23958-rknn-shared-weights.patch
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/immich-machine-learning
+  PACKAGE_NAME: immich-machine-learning
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+    steps:
+      - name: Determine target Immich version + tag
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.immich_version }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -e
+          if [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version=$(gh api /repos/immich-app/immich/releases/latest --jq '.tag_name')
+          fi
+          tag="${version}-rknn"
+          echo "Target version: $version"
+          echo "Target tag    : $tag"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "force_rebuild=true; building"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          owner="${{ github.repository_owner }}"
+          exists=""
+          if response=$(gh api "/users/$owner/packages/container/${{ env.PACKAGE_NAME }}/versions" --paginate 2>/dev/null); then
+            exists=$(echo "$response" | jq -r --arg tag "$tag" '.[] | select((.metadata.container.tags // []) | index($tag)) | .name' | head -1)
+          fi
+          if [ -n "$exists" ]; then
+            echo "Tag $tag already in package (digest=$exists). Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $tag not in package; will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-push:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch-repo
+
+      - name: Clone Immich at target version
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          set -e
+          git clone --depth 1 --branch "$VERSION" https://github.com/immich-app/immich.git immich
+          cd immich
+          echo "Immich HEAD:"
+          git log -1 --oneline
+
+      - name: Apply PR #23958 patch
+        working-directory: immich
+        run: |
+          set -e
+          patch_file="../patch-repo/${{ env.PATCH_FILE }}"
+          echo "::group::patch contents (head)"
+          head -5 "$patch_file"
+          echo "::endgroup::"
+          echo "Verifying patch applies cleanly to Immich ${{ needs.resolve-version.outputs.version }}..."
+          if ! git apply --check "$patch_file"; then
+            echo "::error::Patch ${{ env.PATCH_FILE }} does NOT apply to ${{ needs.resolve-version.outputs.version }}. Refresh the patch and retry."
+            exit 1
+          fi
+          git apply "$patch_file"
+          echo "Patch applied. Modified state:"
+          git status --short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push prod-rknn (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./immich/machine-learning
+          file: ./immich/machine-learning/Dockerfile
+          target: prod-rknn
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.tag }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Immich machine-learning RKNN variant with PR #23958 (shared NPU weights) applied
+            org.opencontainers.image.licenses=AGPL-3.0
+            io.bhyoo.immich.upstream-version=${{ needs.resolve-version.outputs.version }}
+            io.bhyoo.immich.patch=pr-23958-rknn-shared-weights
+
+      - name: Summary
+        run: |
+          echo "## Built image" >> "$GITHUB_STEP_SUMMARY"
+          echo '`${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.tag }}`' >> "$GITHUB_STEP_SUMMARY"
