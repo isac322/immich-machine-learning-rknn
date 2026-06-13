@@ -1,0 +1,269 @@
+name: export-patched-models
+
+# Builds an OCI image that ships the CumSum-rewritten nllb-clip-large-siglip__mrl
+# textual RKNN model for rk3588. Mirrors the build-rknn-image workflow's pattern:
+# tag aligns with the upstream Immich version so consumers can pin both images to
+# the same release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      immich_version:
+        description: Immich tag to align patched model image to (e.g. v2.7.5). Empty = latest release.
+        required: false
+        type: string
+      force_rebuild:
+        description: Rebuild even if the matching tag is already in the package.
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '15 4 * * *'  # 15min after the ML image workflow
+  push:
+    branches: [main]
+    paths:
+      - 'model-patches/**'
+      - '.github/workflows/export-patched-models.yaml'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PATCH_DIR: model-patches
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/immich-patched-models
+  PACKAGE_NAME: immich-patched-models
+  ML_MODEL_NAME: nllb-clip-large-siglip__mrl
+  ML_MODELS_PIN: a8a96c56ed86af512fc14dffe013cae52c0247c6  # merge-base of PR #32; bump only after re-verifying patch applies
+  TARGET_SOC: rk3588
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+      should_build: ${{ steps.detect.outputs.should_build }}
+    steps:
+      - name: Determine target Immich version + tag
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.immich_version }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -e
+          if [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version=$(gh api /repos/immich-app/immich/releases/latest --jq '.tag_name')
+          fi
+          tag="${version}-rknn"
+          echo "Target version: $version"
+          echo "Target tag    : $tag"
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "force_rebuild=true; will build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          owner="${{ github.repository_owner }}"
+          exists=""
+          if response=$(gh api "/users/$owner/packages/container/${{ env.PACKAGE_NAME }}/versions" --paginate 2>/dev/null); then
+            exists=$(echo "$response" | jq -r --arg tag "$tag" '.[] | select((.metadata.container.tags // []) | index($tag)) | .name' | head -1)
+          fi
+          if [ -n "$exists" ]; then
+            echo "Tag $tag already in package (digest=$exists). Skipping export."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $tag not in package; will export and push."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  export-and-push:
+    needs: resolve-version
+    if: needs.resolve-version.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+        with:
+          path: patch-repo
+
+      - name: Free disk space
+        run: |
+          set -e
+          df -h /
+          # Drop apt caches and large default toolchains we don't use to leave room
+          # for HF model downloads + ONNX intermediates + RKNN export.
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /usr/share/dotnet || true
+          df -h /
+
+      - name: Clone ml-models at pinned commit
+        env:
+          ML_MODELS_PIN: ${{ env.ML_MODELS_PIN }}
+        run: |
+          set -e
+          # Pinned to PR #32's merge-base. Bump ML_MODELS_PIN env (and regenerate patch)
+          # if upstream main moves under us.
+          git clone --no-checkout https://github.com/immich-app/ml-models.git ml-models
+          cd ml-models
+          git fetch --depth 1 origin "$ML_MODELS_PIN"
+          git checkout "$ML_MODELS_PIN"
+          echo "ml-models pinned HEAD:"
+          git log -1 --oneline
+
+      - name: Apply model patches in order
+        working-directory: ml-models
+        run: |
+          set -e
+          shopt -s nullglob
+          patches=( ../patch-repo/${{ env.PATCH_DIR }}/*.patch )
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::No patches found in ${{ env.PATCH_DIR }}/"
+            exit 1
+          fi
+          for patch in "${patches[@]}"; do
+            echo "::group::Applying $(basename "$patch")"
+            head -8 "$patch"
+            if ! git apply --check "$patch"; then
+              echo "::error::Patch $(basename "$patch") does NOT apply on ml-models@${{ env.ML_MODELS_PIN }}. Refresh patch series and bump pin."
+              exit 1
+            fi
+            git apply "$patch"
+            echo "::endgroup::"
+          done
+          echo "Patches applied. Modified state:"
+          git status --short
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.15"
+
+      - name: Refresh uv.lock against patched pyproject.toml
+        working-directory: ml-models
+        run: |
+          set -e
+          if git diff --quiet -- pyproject.toml uv.lock; then
+            echo "No pyproject.toml change; lock untouched."
+          else
+            uv lock --no-progress
+          fi
+
+      - name: Install exporter + rknn-toolkit2
+        working-directory: ml-models
+        run: |
+          set -e
+          uv sync --extra rknn
+          # rknn-toolkit2 internally `import pkg_resources` from setuptools;
+          # newer Pythons ship without it, so make sure it's available.
+          uv pip install setuptools
+
+      - name: Download HF model textual subset
+        working-directory: ml-models
+        env:
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          MODEL: ${{ env.ML_MODEL_NAME }}
+        run: |
+          set -e
+          mkdir -p /tmp/model
+          uv run python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+
+          name = os.environ["MODEL"]
+          path = snapshot_download(
+              repo_id=f"immich-app/{name}",
+              local_dir=f"/tmp/model/{name}",
+              allow_patterns=[
+                  "textual/*",
+                  "config.json",
+                  "README.md",
+              ],
+          )
+          print("downloaded:", path)
+          PY
+          du -sh "/tmp/model/${MODEL}" || true
+
+      - name: CumSum patch + RKNN export (rk3588 textual)
+        working-directory: ml-models
+        env:
+          MODEL: ${{ env.ML_MODEL_NAME }}
+          SOC: ${{ env.TARGET_SOC }}
+        run: |
+          set -e
+          uv run python - <<'PY'
+          import os
+          from pathlib import Path
+          from immich_model_exporter.exporters.rknn import export
+
+          model_dir = Path("/tmp/model") / os.environ["MODEL"]
+          soc = os.environ["SOC"]
+          # cache=False so we always re-export inside CI (no stale .rknn in dir).
+          # target_platform restricts work to the SoC we ship; saves ~20min by skipping rk3566/rk3568/rk3576.
+          export(model_dir, cache=False, target_platform=soc)
+          PY
+          OUT="/tmp/model/${MODEL}/textual/rknpu/${SOC}/model.rknn"
+          ls -la "$OUT"
+          sha256sum "$OUT"
+          du -h "$OUT"
+
+      - name: Stage minimal Dockerfile + context
+        env:
+          MODEL: ${{ env.ML_MODEL_NAME }}
+          SOC: ${{ env.TARGET_SOC }}
+        run: |
+          set -e
+          mkdir -p /tmp/ctx
+          cp "/tmp/model/${MODEL}/textual/rknpu/${SOC}/model.rknn" /tmp/ctx/model.rknn
+          cat > /tmp/ctx/Dockerfile <<'EOF'
+          # Minimal carrier image. Consumers mount /model.rknn into the Immich
+          # ML cache directory via an initContainer (or volume-mount the file).
+          FROM busybox:1.37
+          COPY model.rknn /model.rknn
+          EOF
+          ls -la /tmp/ctx/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push patched model image
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/ctx
+          file: /tmp/ctx/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=Immich patched RKNN model (CumSum->MatMul rewrite per ml-models PR #32)
+            org.opencontainers.image.licenses=AGPL-3.0
+            io.bhyoo.immich.upstream-version=${{ needs.resolve-version.outputs.version }}
+            io.bhyoo.immich.model=${{ env.ML_MODEL_NAME }}
+            io.bhyoo.immich.soc=${{ env.TARGET_SOC }}
+            io.bhyoo.immich.patch=ml-models-pr-32-cumsum-matmul
+            io.bhyoo.immich.ml-models-pin=${{ env.ML_MODELS_PIN }}
+
+      - name: Summary
+        run: |
+          echo "## Built model image" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${{ env.IMAGE_NAME }}:${{ needs.resolve-version.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Model: \`${{ env.ML_MODEL_NAME }}\` textual on \`${{ env.TARGET_SOC }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ml-models pin: \`${{ env.ML_MODELS_PIN }}\`" >> "$GITHUB_STEP_SUMMARY"
