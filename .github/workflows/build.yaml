@@ -121,6 +121,24 @@ jobs:
           echo "All patches applied. Modified state:"
           git status --short
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.15"
+
+      - name: Refresh uv.lock against patched pyproject.toml
+        working-directory: immich/machine-learning
+        run: |
+          set -e
+          if git diff --quiet -- pyproject.toml uv.lock; then
+            echo "No pyproject/uv.lock changes from patches; skipping lock refresh."
+          else
+            echo "Regenerating uv.lock to reflect patched pyproject.toml..."
+            uv lock --no-progress
+            echo "uv.lock diff summary:"
+            git diff --stat -- uv.lock || true
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
