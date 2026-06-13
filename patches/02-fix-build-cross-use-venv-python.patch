@@ -1,0 +1,31 @@
+diff --git a/machine-learning/Dockerfile b/machine-learning/Dockerfile
+index 5d5ba90..f70aeb2 100644
+--- a/machine-learning/Dockerfile
++++ b/machine-learning/Dockerfile
+@@ -147,17 +147,19 @@ COPY scripts/healthcheck.py .
+ COPY immich_ml immich_ml
+ 
+ RUN if [ "$DEVICE" = "rknn" ]; then \
+-        apt-get update; \
+-        apt-get install -y g++ libc6-dev; \
+-        cd immich_ml/sessions/rknn/native; \
++        set -e && \
++        apt-get update && \
++        apt-get install -y g++ libc6-dev && \
++        cd immich_ml/sessions/rknn/native && \
++        PATH=/opt/venv/bin:$PATH \
+         RKNN_HEADER=/usr/include/rknn_api.h \
+         RKNN_LIBRARY=/usr/lib/librknnrt.so \
+-        ./build-cross.sh; \
++        ./build-cross.sh && \
+         apt-get purge -y --auto-remove \
+             g++ \
+-            libc6-dev; \
+-        apt-get clean; \
+-        rm -rf /var/lib/apt/lists/*; \
++            libc6-dev && \
++        apt-get clean && \
++        rm -rf /var/lib/apt/lists/* && \
+         rm /usr/include/rknn_api.h; \
+     fi
+ 

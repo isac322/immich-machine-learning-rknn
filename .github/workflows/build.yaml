@@ -25,7 +25,7 @@ permissions:
   packages: write
 
 env:
-  PATCH_FILE: patches/pr-23958-rknn-shared-weights.patch
+  PATCH_DIR: patches
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/immich-machine-learning
   PACKAGE_NAME: immich-machine-learning
 
@@ -98,21 +98,27 @@ jobs:
           echo "Immich HEAD:"
           git log -1 --oneline
 
-      - name: Apply PR #23958 patch
+      - name: Apply patches in order
         working-directory: immich
         run: |
           set -e
-          patch_file="../patch-repo/${{ env.PATCH_FILE }}"
-          echo "::group::patch contents (head)"
-          head -5 "$patch_file"
-          echo "::endgroup::"
-          echo "Verifying patch applies cleanly to Immich ${{ needs.resolve-version.outputs.version }}..."
-          if ! git apply --check "$patch_file"; then
-            echo "::error::Patch ${{ env.PATCH_FILE }} does NOT apply to ${{ needs.resolve-version.outputs.version }}. Refresh the patch and retry."
+          shopt -s nullglob
+          patches=( ../patch-repo/${{ env.PATCH_DIR }}/*.patch )
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::No patches found in ${{ env.PATCH_DIR }}/"
             exit 1
           fi
-          git apply "$patch_file"
-          echo "Patch applied. Modified state:"
+          for patch in "${patches[@]}"; do
+            echo "::group::Applying $(basename "$patch")"
+            head -5 "$patch"
+            if ! git apply --check "$patch"; then
+              echo "::error::Patch $(basename "$patch") does NOT apply to ${{ needs.resolve-version.outputs.version }}. Refresh the patch series and retry."
+              exit 1
+            fi
+            git apply "$patch"
+            echo "::endgroup::"
+          done
+          echo "All patches applied. Modified state:"
           git status --short
 
       - name: Set up Docker Buildx
