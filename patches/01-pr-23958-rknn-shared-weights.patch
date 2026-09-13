@@ -1,5 +1,5 @@
 diff --git a/machine-learning/Dockerfile b/machine-learning/Dockerfile
-index 89480a8cb..5d5ba9073 100644
+index c8191e3..96f1f08 100644
 --- a/machine-learning/Dockerfile
 +++ b/machine-learning/Dockerfile
 @@ -107,12 +107,13 @@ COPY --from=builder-armnn \
@@ -41,10 +41,10 @@ index 89480a8cb..5d5ba9073 100644
  ARG BUILD_IMAGE
  ARG BUILD_SOURCE_REF
 diff --git a/machine-learning/immich_ml/sessions/rknn/__init__.py b/machine-learning/immich_ml/sessions/rknn/__init__.py
-index e388e4feb..fa17d9386 100644
+index 721fe5b..fa17d93 100644
 --- a/machine-learning/immich_ml/sessions/rknn/__init__.py
 +++ b/machine-learning/immich_ml/sessions/rknn/__init__.py
-@@ -1,76 +1,10 @@
+@@ -1,79 +1,10 @@
 -from __future__ import annotations
 -
 -from pathlib import Path
@@ -101,10 +101,13 @@ index e388e4feb..fa17d9386 100644
 -    def get_outputs(self) -> list[SessionNode]:
 -        return [RknnNode(name=k, shape=v) for k, v in input_output_mapping[self.model_type]["output"].items()]
 -
+-    def get_metadata(self) -> dict[str, str]:
+-        return {}
+-
 -    def run(
 -        self,
 -        output_names: list[str] | None,
--        input_feed: dict[str, NDArray[np.float32]] | dict[str, NDArray[np.int32]],
+-        input_feed: dict[str, NDArray[np.float32]] | dict[str, NDArray[np.int32]] | dict[str, NDArray[np.uint8]],
 -        run_options: Any = None,
 -    ) -> list[NDArray[np.float32]]:
 -        input_data: list[NDArray[np.float32]] = [np.ascontiguousarray(v) for v in input_feed.values()]
@@ -116,7 +119,7 @@ index e388e4feb..fa17d9386 100644
 -
 -
 -class RknnNode(NamedTuple):
--    name: str | None
+-    name: str
 -    shape: tuple[int, ...]
 -
 -
@@ -133,10 +136,10 @@ index e388e4feb..fa17d9386 100644
 +]
 diff --git a/machine-learning/immich_ml/sessions/rknn/immich_session.py b/machine-learning/immich_ml/sessions/rknn/immich_session.py
 new file mode 100644
-index 000000000..f7246d1bd
+index 0000000..08e32cd
 --- /dev/null
 +++ b/machine-learning/immich_ml/sessions/rknn/immich_session.py
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,269 @@
 +from __future__ import annotations
 +
 +import threading
@@ -299,6 +302,9 @@ index 000000000..f7246d1bd
 +    def get_outputs(self) -> list[SessionNode]:
 +        return self._output_nodes
 +
++    def get_metadata(self) -> dict[str, str]:
++        return {}
++
 +    def run(
 +        self,
 +        _output_names: Sequence[str] | None,
@@ -405,7 +411,7 @@ index 000000000..f7246d1bd
 +        return desc
 diff --git a/machine-learning/immich_ml/sessions/rknn/inference_test.py b/machine-learning/immich_ml/sessions/rknn/inference_test.py
 new file mode 100644
-index 000000000..fc92b8a4d
+index 0000000..fc92b8a
 --- /dev/null
 +++ b/machine-learning/immich_ml/sessions/rknn/inference_test.py
 @@ -0,0 +1,138 @@
@@ -549,7 +555,7 @@ index 000000000..fc92b8a4d
 +    main()
 diff --git a/machine-learning/immich_ml/sessions/rknn/native/__init__.py b/machine-learning/immich_ml/sessions/rknn/native/__init__.py
 new file mode 100644
-index 000000000..51c4d71ca
+index 0000000..51c4d71
 --- /dev/null
 +++ b/machine-learning/immich_ml/sessions/rknn/native/__init__.py
 @@ -0,0 +1,7 @@
@@ -562,7 +568,7 @@ index 000000000..51c4d71ca
 +rknn_pool = import_module(f"{__name__}.rknn_pool")
 diff --git a/machine-learning/immich_ml/sessions/rknn/native/build-cross.sh b/machine-learning/immich_ml/sessions/rknn/native/build-cross.sh
 new file mode 100755
-index 000000000..e90dd06d6
+index 0000000..e90dd06
 --- /dev/null
 +++ b/machine-learning/immich_ml/sessions/rknn/native/build-cross.sh
 @@ -0,0 +1,64 @@
@@ -632,7 +638,7 @@ index 000000000..e90dd06d6
 +echo "[build-cross] Done."
 diff --git a/machine-learning/immich_ml/sessions/rknn/native/rknn_pool.cpp b/machine-learning/immich_ml/sessions/rknn/native/rknn_pool.cpp
 new file mode 100644
-index 000000000..fe745720c
+index 0000000..fe74572
 --- /dev/null
 +++ b/machine-learning/immich_ml/sessions/rknn/native/rknn_pool.cpp
 @@ -0,0 +1,414 @@
@@ -1050,105 +1056,8 @@ index 000000000..fe745720c
 +}
 +
 +
-diff --git a/machine-learning/immich_ml/sessions/rknn/rknnpool.py b/machine-learning/immich_ml/sessions/rknn/rknnpool.py
-deleted file mode 100644
-index fd0af8bcc..000000000
---- a/machine-learning/immich_ml/sessions/rknn/rknnpool.py
-+++ /dev/null
-@@ -1,91 +0,0 @@
--# This code is from leafqycc/rknn-multi-threaded
--# Following Apache License 2.0
--
--import logging
--from concurrent.futures import Future, ThreadPoolExecutor
--from pathlib import Path
--from queue import Queue
--from typing import Callable
--
--import numpy as np
--from numpy.typing import NDArray
--
--from immich_ml.config import log
--from immich_ml.models.constants import RKNN_COREMASK_SUPPORTED_SOCS, RKNN_SUPPORTED_SOCS
--
--
--def get_soc(device_tree_path: Path | str) -> str | None:
--    try:
--        with Path(device_tree_path).open() as f:
--            device_compatible_str = f.read()
--            for soc in RKNN_SUPPORTED_SOCS:
--                if soc in device_compatible_str:
--                    return soc
--            log.warning("Device is not supported for RKNN")
--    except OSError as e:
--        log.warning(f"Could not read {device_tree_path}. Reason: %s", e)
--    return None
--
--
--soc_name = None
--is_available = False
--try:
--    from rknnlite.api import RKNNLite
--
--    soc_name = get_soc("/proc/device-tree/compatible")
--    is_available = soc_name is not None
--except ImportError:
--    log.debug("RKNN is not available")
--
--
--def init_rknn(model_path: str) -> "RKNNLite":
--    if not is_available:
--        raise RuntimeError("rknn is not available!")
--    rknn_lite = RKNNLite()
--    rknn_lite.rknn_log.logger.setLevel(logging.ERROR)
--    ret = rknn_lite.load_rknn(model_path)
--    if ret != 0:
--        raise RuntimeError("Failed to load RKNN model")
--
--    if soc_name in RKNN_COREMASK_SUPPORTED_SOCS:
--        ret = rknn_lite.init_runtime(core_mask=RKNNLite.NPU_CORE_AUTO)
--    else:
--        ret = rknn_lite.init_runtime()  # Please do not set this parameter on other platforms.
--
--    if ret != 0:
--        raise RuntimeError("Failed to initialize RKNN runtime environment")
--
--    return rknn_lite
--
--
--class RknnPoolExecutor:
--    def __init__(
--        self,
--        model_path: str,
--        tpes: int,
--        func: Callable[["RKNNLite", list[NDArray[np.float32]]], list[NDArray[np.float32]]],
--    ) -> None:
--        self.tpes = tpes
--        self.queue: Queue[Future[list[NDArray[np.float32]]]] = Queue()
--        self.rknn_pool = [init_rknn(model_path) for _ in range(tpes)]
--        self.pool = ThreadPoolExecutor(max_workers=tpes)
--        self.func = func
--        self.num = 0
--
--    def put(self, inputs: list[NDArray[np.float32]]) -> None:
--        self.queue.put(self.pool.submit(self.func, self.rknn_pool[self.num % self.tpes], inputs))
--        self.num += 1
--
--    def get(self) -> list[NDArray[np.float32]] | None:
--        if self.queue.empty():
--            return None
--        fut = self.queue.get()
--        return fut.result()
--
--    def release(self) -> None:
--        self.pool.shutdown()
--        for rknn_lite in self.rknn_pool:
--            rknn_lite.release()
--
--    def __del__(self) -> None:
--        self.release()
 diff --git a/machine-learning/pyproject.toml b/machine-learning/pyproject.toml
-index ee5eab7c8..0e065b44c 100644
+index 3111a0e..fc74520 100644
 --- a/machine-learning/pyproject.toml
 +++ b/machine-learning/pyproject.toml
 @@ -51,7 +51,10 @@ cpu = ["onnxruntime>=1.23.2,<2"]
